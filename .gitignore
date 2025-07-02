@@ -1,0 +1,43 @@
+# Build directories
+build/
+cmake-build-*/
+
+# Compiled executables
+*.exe
+*.out
+*.app
+
+# Object files
+*.o
+*.obj
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# SeqAn3 dependency (exclude from version control)
+seqan3/
+
+# Data files (optional - uncomment if you don't want to track data)
+# data/
+
+# Index files
+*.fm_index
