@@ -26,7 +26,7 @@ void initialize_parser(seqan3::argument_parser & parser, cmd_arguments & args)
     parser.info.author = "SeqAn3 Expert Team";
     parser.info.version = "1.0.0";
     parser.info.short_description = "Creates an FM-Index from a directory of DNA files.";
-    parser.info.synopsis = {"create-index <INPUT_DIR>"};
+    parser.info.synopsis = {"kecfm-index <INPUT_DIR>"};
 
     parser.add_positional_option(args.input_dir,
                                  "Path to a directory containing reference DNA files (e.g., FASTA).",
@@ -55,7 +55,7 @@ std::vector<std::filesystem::path> find_sequence_files(std::filesystem::path con
 
 int main(int argc, char ** argv)
 {
-    seqan3::argument_parser parser{"create-index", argc, argv};
+    seqan3::argument_parser parser{"kecfm-index", argc, argv};
     cmd_arguments args{};
     initialize_parser(parser, args);
 

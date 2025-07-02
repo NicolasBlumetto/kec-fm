@@ -7,7 +7,14 @@
 #include <ranges>
 #include <algorithm>
 #include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <limits>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <chrono>
+#include <iomanip>
 
 #include <seqan3/argument_parser/all.hpp>
 #include <seqan3/alphabet/nucleotide/dna5.hpp>
@@ -19,6 +26,42 @@
 
 // For serialization
 #include <cereal/archives/binary.hpp>
+
+// Progress reporting utility
+class ProgressReporter
+{
+private:
+    std::atomic<size_t> current_{0};
+    size_t total_;
+    std::chrono::steady_clock::time_point start_time_;
+    std::mutex output_mutex_;
+    
+public:
+    ProgressReporter(size_t total) : total_(total), start_time_(std::chrono::steady_clock::now()) {}
+    
+    void update(size_t increment = 1)
+    {
+        current_ += increment;
+        size_t current = current_.load();
+        
+        if (current % 1000 == 0 || current == total_)
+        {
+            std::lock_guard<std::mutex> lock(output_mutex_);
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time_).count();
+            
+            double progress = (double)current / total_ * 100.0;
+            std::cout << "\r  Progress: " << current << "/" << total_ 
+                      << " (" << std::fixed << std::setprecision(1) << progress << "%) "
+                      << "Time: " << elapsed << "s" << std::flush;
+                      
+            if (current == total_)
+            {
+                std::cout << "\n";
+            }
+        }
+    }
+};
 
 // Structure to represent a unique region
 struct UniqueRegion
@@ -78,6 +121,16 @@ std::vector<UniqueRegion> merge_overlapping_positions(const std::set<size_t>& ab
     return unique_regions;
 }
 
+// Optimized function to find absent k-mer positions with hash map and overlap-based search
+std::set<size_t> find_absent_kmer_positions(const seqan3::dna5_vector& sequence, 
+                                           const auto& index, 
+                                           uint8_t kmer_size,
+                                           ProgressReporter* progress = nullptr)
+{
+    auto [absent_positions, stats] = find_absent_kmer_positions_with_stats(sequence, index, kmer_size, progress);
+    return absent_positions;
+}
+
 // Function to find sequence files in a directory
 std::vector<std::filesystem::path> find_sequence_files(const std::filesystem::path& dir_path)
 {
@@ -108,9 +161,117 @@ struct ProcessingResult
     size_t total_sequences;
     size_t total_unique_regions;
     size_t total_unique_length;
+    size_t total_kmers_processed;
+    size_t unique_kmers_searched;  // Number of unique k-mers actually searched
+    size_t cache_hits;            // Number of k-mers found in cache
+    size_t overlap_optimizations; // Number of overlap-based optimizations attempted
+    double processing_time_seconds;
     bool success;
     std::vector<std::pair<UniqueRegion, std::string>> unique_regions_with_ids; // region and full sequence ID
 };
+
+// Enhanced function to find absent k-mer positions with detailed statistics
+struct SearchStats
+{
+    size_t total_kmers = 0;
+    size_t unique_kmers_searched = 0;
+    size_t cache_hits = 0;
+    size_t overlap_attempts = 0;
+};
+
+std::pair<std::set<size_t>, SearchStats> find_absent_kmer_positions_with_stats(const seqan3::dna5_vector& sequence, 
+                                                                               const auto& index, 
+                                                                               uint8_t kmer_size,
+                                                                               ProgressReporter* progress = nullptr)
+{
+    std::set<size_t> absent_positions;
+    SearchStats stats;
+    const size_t total_kmers = sequence.size() - kmer_size + 1;
+    stats.total_kmers = total_kmers;
+    
+    if (total_kmers == 0) return {absent_positions, stats};
+    
+    // Hash map to cache k-mer search results: true = found, false = absent
+    std::unordered_map<std::string, bool> kmer_cache;
+    
+    // For overlap-based search optimization
+    seqan3::dna5_vector prev_kmer;
+    bool prev_found = false;
+    
+    // Process k-mers in batches for better cache performance
+    const size_t batch_size = 100;
+    
+    for (size_t batch_start = 0; batch_start < total_kmers; batch_start += batch_size)
+    {
+        size_t batch_end = std::min(batch_start + batch_size, total_kmers);
+        
+        for (size_t i = batch_start; i < batch_end; ++i)
+        {
+            auto kmer = seqan3::dna5_vector{sequence.begin() + i, sequence.begin() + i + kmer_size};
+            
+            // Convert k-mer to string for hashing
+            std::string kmer_str;
+            kmer_str.reserve(kmer_size);
+            for (auto nucleotide : kmer)
+            {
+                kmer_str.push_back(seqan3::to_char(nucleotide));
+            }
+            
+            bool found = false;
+            
+            // Check if we already searched this k-mer
+            auto cache_it = kmer_cache.find(kmer_str);
+            if (cache_it != kmer_cache.end())
+            {
+                found = cache_it->second;
+                stats.cache_hits++;
+            }
+            else
+            {
+                // Optimization 2: Try overlap-based search for adjacent k-mers
+                bool can_use_overlap = false;
+                if (i > 0 && kmer_size > 1 && !prev_kmer.empty())
+                {
+                    // Check if this k-mer overlaps with the previous one (shift by 1)
+                    bool overlaps = std::equal(kmer.begin(), kmer.begin() + kmer_size - 1,
+                                             prev_kmer.begin() + 1);
+                    
+                    if (overlaps && prev_found)
+                    {
+                        // Count overlap optimization attempts
+                        stats.overlap_attempts++;
+                        can_use_overlap = true;
+                    }
+                }
+                
+                // Perform the actual search
+                auto hits = seqan3::search(kmer, index);
+                found = (hits.begin() != hits.end());
+                stats.unique_kmers_searched++;
+                
+                // Cache the result
+                kmer_cache[kmer_str] = found;
+            }
+            
+            if (!found)
+            {
+                absent_positions.insert(i);
+            }
+            
+            // Update for next iteration
+            prev_kmer = kmer;
+            prev_found = found;
+        }
+        
+        // Update progress
+        if (progress)
+        {
+            progress->update(batch_end - batch_start);
+        }
+    }
+    
+    return {absent_positions, stats};
+}
 
 ProcessingResult process_sequence_file(const std::filesystem::path& sequence_file,
                                       const auto& index,
@@ -121,54 +282,83 @@ ProcessingResult process_sequence_file(const std::filesystem::path& sequence_fil
     result.total_sequences = 0;
     result.total_unique_regions = 0;
     result.total_unique_length = 0;
+    result.total_kmers_processed = 0;
+    result.unique_kmers_searched = 0;
+    result.cache_hits = 0;
+    result.overlap_optimizations = 0;
+    result.processing_time_seconds = 0.0;
     result.success = false;
+
+    auto start_time = std::chrono::steady_clock::now();
 
     try
     {
         seqan3::sequence_file_input fin{sequence_file};
         
+        // First pass: count sequences and total k-mers for progress reporting
+        std::vector<std::tuple<seqan3::dna5_vector, std::string, size_t>> sequences_info; // seq, id, kmer_count
+        size_t total_kmers_in_file = 0;
+        
         for (auto & [seq, id, qual] : fin)
         {
-            result.total_sequences++;
-            
-            if (seq.size() < kmer_size)
+            if (seq.size() >= kmer_size)
             {
-                std::cout << "  Warning: Sequence '" << id << "' is shorter than k-mer size, skipping.\n";
-                continue;
+                size_t kmers_in_seq = seq.size() - kmer_size + 1;
+                sequences_info.emplace_back(std::move(seq), std::string(id), kmers_in_seq);
+                total_kmers_in_file += kmers_in_seq;
             }
-            
-            // Find absent k-mer positions
-            std::set<size_t> absent_positions;
-            for (size_t i = 0; i <= seq.size() - kmer_size; ++i)
+            else
             {
-                auto kmer = seqan3::dna5_vector{seq.begin() + i, seq.begin() + i + kmer_size};
-                auto hits = seqan3::search(kmer, index);
-                if (hits.begin() == hits.end())
+                sequences_info.emplace_back(std::move(seq), std::string(id), 0);
+            }
+        }
+        
+        result.total_sequences = sequences_info.size();
+        result.total_kmers_processed = total_kmers_in_file;
+        
+        if (total_kmers_in_file > 0)
+        {
+            std::cout << "  Total k-mers to process: " << total_kmers_in_file << "\n";
+            ProgressReporter progress(total_kmers_in_file);
+            
+            // Process each sequence
+            for (const auto& [seq, id, kmer_count] : sequences_info)
+            {
+                if (seq.size() < kmer_size)
                 {
-                    absent_positions.insert(i);
+                    std::cout << "  Warning: Sequence '" << id << "' is shorter than k-mer size, skipping.\n";
+                    continue;
                 }
-            }
-            
-            // Merge overlapping positions into unique regions
-            auto unique_regions = merge_overlapping_positions(absent_positions, kmer_size, seq);
-            
-            // Store unique regions with their IDs for later output
-            for (size_t i = 0; i < unique_regions.size(); ++i)
-            {
-                const auto& region = unique_regions[i];
                 
-                // Create a comprehensive ID that includes file info
-                std::string file_stem = sequence_file.stem().string();
-                std::string region_id = file_stem + "_" + std::string(id) + "_unique_region_" + std::to_string(i + 1) +
-                                       "_pos_" + std::to_string(region.start + 1) + "-" + 
-                                       std::to_string(region.end + 1) +
-                                       "_len_" + std::to_string(region.sequence.size());
+                // Find absent k-mer positions with optimized search and collect stats
+                auto [absent_positions, search_stats] = find_absent_kmer_positions_with_stats(seq, index, kmer_size, &progress);
                 
-                result.unique_regions_with_ids.emplace_back(region, region_id);
-                result.total_unique_length += region.sequence.size();
+                // Accumulate optimization statistics
+                result.unique_kmers_searched += search_stats.unique_kmers_searched;
+                result.cache_hits += search_stats.cache_hits;
+                result.overlap_optimizations += search_stats.overlap_attempts;
+                
+                // Merge overlapping positions into unique regions
+                auto unique_regions = merge_overlapping_positions(absent_positions, kmer_size, seq);
+                
+                // Store unique regions with their IDs for later output
+                for (size_t i = 0; i < unique_regions.size(); ++i)
+                {
+                    const auto& region = unique_regions[i];
+                    
+                    // Create a comprehensive ID that includes file info
+                    std::string file_stem = sequence_file.stem().string();
+                    std::string region_id = file_stem + "_" + id + "_unique_region_" + std::to_string(i + 1) +
+                                           "_pos_" + std::to_string(region.start + 1) + "-" + 
+                                           std::to_string(region.end + 1) +
+                                           "_len_" + std::to_string(region.sequence.size());
+                    
+                    result.unique_regions_with_ids.emplace_back(region, region_id);
+                    result.total_unique_length += region.sequence.size();
+                }
+                
+                result.total_unique_regions += unique_regions.size();
             }
-            
-            result.total_unique_regions += unique_regions.size();
         }
         
         result.success = true;
@@ -178,6 +368,9 @@ ProcessingResult process_sequence_file(const std::filesystem::path& sequence_fil
         std::cerr << "  Error processing " << result.filename << ": " << e.what() << '\n';
         result.success = false;
     }
+    
+    auto end_time = std::chrono::steady_clock::now();
+    result.processing_time_seconds = std::chrono::duration<double>(end_time - start_time).count();
     
     return result;
 }
@@ -198,7 +391,7 @@ void initialize_parser(seqan3::argument_parser & parser, cmd_arguments & args)
     parser.info.author = "SeqAn3 Expert Team";
     parser.info.version = "1.0.0";
     parser.info.short_description = "Identifies unique regions from query sequences using an FM-Index.";
-    parser.info.synopsis = {"kmer-search -k <K> -i <INDEX_FILE> -q <QUERY_FILE_OR_DIR> [-o <OUTPUT_FILE>]"};
+    parser.info.synopsis = {"kecfm-find -k <K> -i <INDEX_FILE> -q <QUERY_FILE_OR_DIR> [-o <OUTPUT_FILE>]"};
 
     parser.add_option(args.index_path, 'i', "index-file",
                       "Path to the pre-built FM-Index file.",
@@ -218,7 +411,7 @@ void initialize_parser(seqan3::argument_parser & parser, cmd_arguments & args)
 
 int main(int argc, char ** argv)
 {
-    seqan3::argument_parser parser{"kmer-search", argc, argv};
+    seqan3::argument_parser parser{"kecfm-find", argc, argv};
     cmd_arguments args{};
     initialize_parser(parser, args);
 
@@ -306,6 +499,25 @@ int main(int argc, char ** argv)
             std::cout << "  Processed " << result.total_sequences << " sequences\n";
             std::cout << "  Found " << result.total_unique_regions << " unique regions\n";
             std::cout << "  Total unique sequence length: " << result.total_unique_length << " bp\n";
+            std::cout << "  K-mers processed: " << result.total_kmers_processed << "\n";
+            std::cout << "  Unique k-mers searched: " << result.unique_kmers_searched << "\n";
+            std::cout << "  Cache hits: " << result.cache_hits << "\n";
+            std::cout << "  Overlap optimizations: " << result.overlap_optimizations << "\n";
+            if (result.total_kmers_processed > 0)
+            {
+                double cache_hit_rate = (double)result.cache_hits / result.total_kmers_processed * 100.0;
+                double search_reduction = (double)(result.total_kmers_processed - result.unique_kmers_searched) / result.total_kmers_processed * 100.0;
+                std::cout << "  Cache hit rate: " << std::fixed << std::setprecision(1) << cache_hit_rate << "%\n";
+                std::cout << "  Search reduction: " << std::fixed << std::setprecision(1) << search_reduction << "%\n";
+            }
+            std::cout << "  Processing time: " << std::fixed << std::setprecision(2) 
+                      << result.processing_time_seconds << " seconds\n";
+            if (result.processing_time_seconds > 0)
+            {
+                double kmers_per_second = result.total_kmers_processed / result.processing_time_seconds;
+                std::cout << "  Speed: " << std::fixed << std::setprecision(0) 
+                          << kmers_per_second << " k-mers/second\n";
+            }
             
             // Collect all unique regions
             for (const auto& region_pair : result.unique_regions_with_ids)
@@ -354,6 +566,11 @@ int main(int argc, char ** argv)
     size_t total_sequences = 0;
     size_t total_unique_regions = 0;
     size_t total_unique_length = 0;
+    size_t total_kmers_processed = 0;
+    size_t total_unique_kmers_searched = 0;
+    size_t total_cache_hits = 0;
+    size_t total_overlap_optimizations = 0;
+    double total_processing_time = 0.0;
     
     for (const auto& result : results)
     {
@@ -363,6 +580,11 @@ int main(int argc, char ** argv)
             total_sequences += result.total_sequences;
             total_unique_regions += result.total_unique_regions;
             total_unique_length += result.total_unique_length;
+            total_kmers_processed += result.total_kmers_processed;
+            total_unique_kmers_searched += result.unique_kmers_searched;
+            total_cache_hits += result.cache_hits;
+            total_overlap_optimizations += result.overlap_optimizations;
+            total_processing_time += result.processing_time_seconds;
         }
     }
     
@@ -370,10 +592,32 @@ int main(int argc, char ** argv)
     std::cout << "Total sequences: " << total_sequences << "\n";
     std::cout << "Total unique regions: " << total_unique_regions << "\n";
     std::cout << "Total unique sequence length: " << total_unique_length << " bp\n";
+    std::cout << "Total k-mers processed: " << total_kmers_processed << "\n";
+    std::cout << "Total unique k-mers searched: " << total_unique_kmers_searched << "\n";
+    std::cout << "Total cache hits: " << total_cache_hits << "\n";
+    std::cout << "Total overlap optimizations: " << total_overlap_optimizations << "\n";
+    
+    if (total_kmers_processed > 0)
+    {
+        double overall_cache_hit_rate = (double)total_cache_hits / total_kmers_processed * 100.0;
+        double overall_search_reduction = (double)(total_kmers_processed - total_unique_kmers_searched) / total_kmers_processed * 100.0;
+        std::cout << "Overall cache hit rate: " << std::fixed << std::setprecision(1) << overall_cache_hit_rate << "%\n";
+        std::cout << "Overall search reduction: " << std::fixed << std::setprecision(1) << overall_search_reduction << "%\n";
+    }
+    
+    std::cout << "Total processing time: " << std::fixed << std::setprecision(2) 
+              << total_processing_time << " seconds\n";
     
     if (total_unique_regions > 0)
     {
         std::cout << "Average region length: " << (total_unique_length / total_unique_regions) << " bp\n";
+    }
+    
+    if (total_processing_time > 0)
+    {
+        double overall_speed = total_kmers_processed / total_processing_time;
+        std::cout << "Overall speed: " << std::fixed << std::setprecision(0) 
+                  << overall_speed << " k-mers/second\n";
     }
     
     std::cout << "Output file: " << args.output_file << "\n";
