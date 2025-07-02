@@ -71,6 +71,58 @@ struct UniqueRegion
     seqan3::dna5_vector sequence;
 };
 
+// Global k-mer cache for cross-file optimization
+class GlobalKmerCache
+{
+private:
+    std::unordered_map<std::string, bool> cache_;
+    mutable std::mutex cache_mutex_;
+    
+public:
+    bool find(const std::string& kmer, bool& found_in_index)
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        auto it = cache_.find(kmer);
+        if (it != cache_.end())
+        {
+            found_in_index = it->second;
+            return true; // found in cache
+        }
+        return false; // not in cache
+    }
+    
+    void insert(const std::string& kmer, bool found_in_index)
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        cache_[kmer] = found_in_index;
+    }
+    
+    size_t size() const
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        return cache_.size();
+    }
+    
+    void clear()
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        cache_.clear();
+    }
+    
+    // Get cache statistics
+    std::pair<size_t, size_t> get_stats() const
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        size_t total = cache_.size();
+        size_t found_count = 0;
+        for (const auto& [kmer, found] : cache_)
+        {
+            if (found) found_count++;
+        }
+        return {total, found_count};
+    }
+};
+
 // Function to merge overlapping k-mer positions into unique regions
 std::vector<UniqueRegion> merge_overlapping_positions(const std::set<size_t>& absent_positions, 
                                                       uint8_t kmer_size,
@@ -125,9 +177,10 @@ std::vector<UniqueRegion> merge_overlapping_positions(const std::set<size_t>& ab
 std::set<size_t> find_absent_kmer_positions(const seqan3::dna5_vector& sequence, 
                                            const auto& index, 
                                            uint8_t kmer_size,
+                                           GlobalKmerCache& global_cache,
                                            ProgressReporter* progress = nullptr)
 {
-    auto [absent_positions, stats] = find_absent_kmer_positions_with_stats(sequence, index, kmer_size, progress);
+    auto [absent_positions, stats] = find_absent_kmer_positions_with_stats(sequence, index, kmer_size, global_cache, progress);
     return absent_positions;
 }
 
@@ -182,6 +235,7 @@ struct SearchStats
 std::pair<std::set<size_t>, SearchStats> find_absent_kmer_positions_with_stats(const seqan3::dna5_vector& sequence, 
                                                                                const auto& index, 
                                                                                uint8_t kmer_size,
+                                                                               GlobalKmerCache& global_cache,
                                                                                ProgressReporter* progress = nullptr)
 {
     std::set<size_t> absent_positions;
@@ -190,9 +244,6 @@ std::pair<std::set<size_t>, SearchStats> find_absent_kmer_positions_with_stats(c
     stats.total_kmers = total_kmers;
     
     if (total_kmers == 0) return {absent_positions, stats};
-    
-    // Hash map to cache k-mer search results: true = found, false = absent
-    std::unordered_map<std::string, bool> kmer_cache;
     
     // For overlap-based search optimization
     seqan3::dna5_vector prev_kmer;
@@ -219,17 +270,14 @@ std::pair<std::set<size_t>, SearchStats> find_absent_kmer_positions_with_stats(c
             
             bool found = false;
             
-            // Check if we already searched this k-mer
-            auto cache_it = kmer_cache.find(kmer_str);
-            if (cache_it != kmer_cache.end())
+            // Check global cache first
+            if (global_cache.find(kmer_str, found))
             {
-                found = cache_it->second;
                 stats.cache_hits++;
             }
             else
             {
                 // Optimization 2: Try overlap-based search for adjacent k-mers
-                bool can_use_overlap = false;
                 if (i > 0 && kmer_size > 1 && !prev_kmer.empty())
                 {
                     // Check if this k-mer overlaps with the previous one (shift by 1)
@@ -240,7 +288,6 @@ std::pair<std::set<size_t>, SearchStats> find_absent_kmer_positions_with_stats(c
                     {
                         // Count overlap optimization attempts
                         stats.overlap_attempts++;
-                        can_use_overlap = true;
                     }
                 }
                 
@@ -249,8 +296,8 @@ std::pair<std::set<size_t>, SearchStats> find_absent_kmer_positions_with_stats(c
                 found = (hits.begin() != hits.end());
                 stats.unique_kmers_searched++;
                 
-                // Cache the result
-                kmer_cache[kmer_str] = found;
+                // Cache the result in global cache
+                global_cache.insert(kmer_str, found);
             }
             
             if (!found)
@@ -275,7 +322,8 @@ std::pair<std::set<size_t>, SearchStats> find_absent_kmer_positions_with_stats(c
 
 ProcessingResult process_sequence_file(const std::filesystem::path& sequence_file,
                                       const auto& index,
-                                      uint8_t kmer_size)
+                                      uint8_t kmer_size,
+                                      GlobalKmerCache& global_cache)
 {
     ProcessingResult result;
     result.filename = sequence_file.filename().string();
@@ -331,7 +379,7 @@ ProcessingResult process_sequence_file(const std::filesystem::path& sequence_fil
                 }
                 
                 // Find absent k-mer positions with optimized search and collect stats
-                auto [absent_positions, search_stats] = find_absent_kmer_positions_with_stats(seq, index, kmer_size, &progress);
+                auto [absent_positions, search_stats] = find_absent_kmer_positions_with_stats(seq, index, kmer_size, global_cache, &progress);
                 
                 // Accumulate optimization statistics
                 result.unique_kmers_searched += search_stats.unique_kmers_searched;
@@ -483,6 +531,10 @@ int main(int argc, char ** argv)
     }
     std::cout << "Index loaded successfully.\n\n";
 
+    // Create global k-mer cache for cross-file optimization
+    GlobalKmerCache global_cache;
+    std::cout << "Initialized global k-mer cache for cross-file optimization.\n\n";
+
     // Process each query file
     std::vector<ProcessingResult> results;
     std::vector<std::pair<UniqueRegion, std::string>> all_unique_regions;
@@ -491,7 +543,15 @@ int main(int argc, char ** argv)
     {
         std::cout << "Processing: " << query_file.filename().string() << "\n";
         
-        auto result = process_sequence_file(query_file, index, args.kmer_size);
+        // Show current cache status
+        auto [cache_size, found_in_cache] = global_cache.get_stats();
+        if (cache_size > 0)
+        {
+            std::cout << "  Global cache: " << cache_size << " k-mers cached (" 
+                      << found_in_cache << " found, " << (cache_size - found_in_cache) << " absent)\n";
+        }
+        
+        auto result = process_sequence_file(query_file, index, args.kmer_size, global_cache);
         results.push_back(result);
         
         if (result.success)
@@ -558,9 +618,21 @@ int main(int argc, char ** argv)
     {
         std::cout << "No unique regions found across all files.\n\n";
     }
+    
+    // Final global cache statistics
+    auto [final_cache_size, final_found_in_cache] = global_cache.get_stats();
+    std::cout << "\n=== GLOBAL CACHE STATISTICS ===\n";
+    std::cout << "Total unique k-mers encountered: " << final_cache_size << "\n";
+    std::cout << "K-mers found in index: " << final_found_in_cache << "\n";
+    std::cout << "K-mers absent from index: " << (final_cache_size - final_found_in_cache) << "\n";
+    if (final_cache_size > 0)
+    {
+        double found_percentage = (double)final_found_in_cache / final_cache_size * 100.0;
+        std::cout << "Index coverage: " << std::fixed << std::setprecision(1) << found_percentage << "%\n";
+    }
 
     // Print summary statistics
-    std::cout << "=== SUMMARY ===\n";
+    std::cout << "\n=== SUMMARY ===\n";
     size_t total_files = results.size();
     size_t successful_files = 0;
     size_t total_sequences = 0;
@@ -603,6 +675,15 @@ int main(int argc, char ** argv)
         double overall_search_reduction = (double)(total_kmers_processed - total_unique_kmers_searched) / total_kmers_processed * 100.0;
         std::cout << "Overall cache hit rate: " << std::fixed << std::setprecision(1) << overall_cache_hit_rate << "%\n";
         std::cout << "Overall search reduction: " << std::fixed << std::setprecision(1) << overall_search_reduction << "%\n";
+        
+        // Calculate global cache effectiveness
+        if (final_cache_size > 0)
+        {
+            double cache_utilization = (double)total_cache_hits / (total_kmers_processed - total_unique_kmers_searched + total_cache_hits) * 100.0;
+            double deduplication_ratio = (double)total_kmers_processed / final_cache_size;
+            std::cout << "Global cache utilization: " << std::fixed << std::setprecision(1) << cache_utilization << "%\n";
+            std::cout << "K-mer deduplication ratio: " << std::fixed << std::setprecision(1) << deduplication_ratio << ":1\n";
+        }
     }
     
     std::cout << "Total processing time: " << std::fixed << std::setprecision(2) 
